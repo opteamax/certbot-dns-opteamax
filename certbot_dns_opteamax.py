@@ -15,11 +15,15 @@ from certbot import achallenges
 from certbot.plugins import common
 from certbot.plugins import dns_common
 from certbot.display import util as display_util
+from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import urlopen, Request
 
 logger = logging.getLogger(__name__)
 
 OXAPI_URL = "https://www.opteamax.de/oxapi/dns/"
+# REST API used with an API token (dns_opteamax_token).
+API_URL = "https://api.opteam.ax/api/v2"
 REQUEST_TIMEOUT_S = 60
 DNS_RECORD_TTL_S = 300
 VALIDATION_TIMEOUT_S = DNS_RECORD_TTL_S * 1.5
@@ -58,12 +62,53 @@ class Authenticator(dns_common.DNSAuthenticator):
     def _setup_credentials(self):
         self.credentials = self._configure_credentials(
             'credentials',
-            'Opteamax OXAPI credentials INI file',
-            {
-                'username':      'OXAPI Username',
-                'password':      'OXAPI Password',
-            }
+            'Opteamax credentials INI file',
+            None,
+            self._validate_credentials,
         )
+        if not self._use_token():
+            logger.warning(
+                "certbot-dns-opteamax: username/password authentication against "
+                "the OXAPI is deprecated. Create an API token in the Opteamax "
+                "customer panel under \"API-Tokens\" and set "
+                "dns_opteamax_token in %s instead of username and password.",
+                self.conf('credentials'))
+
+    @staticmethod
+    def _validate_credentials(credentials):
+        if credentials.conf('token'):
+            return
+        if not (credentials.conf('username') and credentials.conf('password')):
+            raise errors.PluginError(
+                "The credentials file must set either dns_opteamax_token "
+                "(recommended) or dns_opteamax_username and dns_opteamax_password.")
+
+    def _use_token(self) -> bool:
+        return bool(self.credentials.conf('token'))
+
+    def _call_api(self, method: str, path: str, data: dict = None):
+        """Call the REST API with the API token (Bearer auth)."""
+        base = (self.credentials.conf('api_url') or API_URL).rstrip('/')
+        url = f"{base}{path}"
+        logger.debug(f"_call_api: {method} {url} {data}")
+        req = Request(url, method=method)
+        req.add_header('Authorization', f"Bearer {self.credentials.conf('token')}")
+        req.add_header('Accept', 'application/json')
+        body = None
+        if data is not None:
+            req.add_header('Content-Type', 'application/json')
+            body = json.dumps(data).encode('utf-8')
+        try:
+            with urlopen(req, body, REQUEST_TIMEOUT_S) as res:
+                response_data = res.read().decode('utf-8')
+        except HTTPError as e:
+            detail = e.read().decode('utf-8', 'replace')
+            raise errors.PluginError(
+                f"Opteamax API returned HTTP {e.code} for {method} {path}: {detail}")
+        except Exception as e:
+            raise errors.PluginError(f"Error communicating with Opteamax API: {e}")
+        logger.debug(f"_call_api: response -> {response_data}\n")
+        return json.loads(response_data) if response_data else None
 
     def more_info(self):
         return ('This plugin configures a DNS TXT record to respond to a '
@@ -91,8 +136,12 @@ class Authenticator(dns_common.DNSAuthenticator):
 
     def _get_ox_domid(self, domain: str) -> (int, str, str):
         logger.debug("_get_ox_domid: domain %s", domain)
-        params = { 'auth': self._build_ox_auth(), 'with_ptr': False }
-        res = self._call_oxapi('get_zones', params)
+        if self._use_token():
+            res = [{'domain': row['domain'].rstrip('.'), 'domain_id': row['domain_id']}
+                   for row in self._call_api('GET', '/dns/domains/')]
+        else:
+            params = { 'auth': self._build_ox_auth(), 'with_ptr': False }
+            res = self._call_oxapi('get_zones', params)
         domid = 0
         longestMatch = ""
         for row in res:
@@ -125,6 +174,28 @@ class Authenticator(dns_common.DNSAuthenticator):
                 logger.debug('_rm_ox_txt_rr: need to delete orphan RR %d subdomain %s target %s', row['dataid'], row['subdomain'], row['target'])
                 self._rm_ox_record(row['dataid'])
 
+    def _add_api_txt_rr(self, domid, fqdn, text) -> None:
+        logger.debug("_add_api_txt_rr: domid %d fqdn %s text %s", domid, fqdn, text)
+        data = {'type': 'TXT', 'name': f"{fqdn}.", 'content': text, 'ttl': DNS_RECORD_TTL_S}
+        self._call_api('POST', f"/dns/domains/{domid}/records/", data)
+
+    def _rm_api_txt_rr(self, domid, fqdn, text) -> None:
+        """Remove only this challenge's TXT record: a wildcard certificate puts
+        two values on the same name. The API returns TXT content in wire format
+        (quoted), hence the substring match."""
+        logger.debug("_rm_api_txt_rr: domid %d fqdn %s text %s", domid, fqdn, text)
+        for row in self._call_api('GET', f"/dns/domains/{domid}/records/"):
+            if (row['type'] == 'TXT' and row['name'].rstrip('.') == fqdn
+                    and text in row['content']):
+                record = quote(str(row['data_id']), safe='')
+                self._call_api('DELETE', f"/dns/domains/{domid}/records/{record}/")
+
+    def _add_txt_rr(self, domid, fqdn, text) -> None:
+        if self._use_token():
+            self._add_api_txt_rr(domid, fqdn, text)
+        else:
+            self._add_ox_txt_rr(domid, fqdn, text)
+
     def _add_ox_txt_rr(self, domid, fqdn, text) -> None:
         logger.debug("_add_ox_txt_rr: domid %d fqdn %s text %s", domid, fqdn, text)
         data = {
@@ -154,7 +225,7 @@ class Authenticator(dns_common.DNSAuthenticator):
 
             logger.debug("_perform: domain %s validation_domain_name %s validation %s", domain, validation_domain_name, validation)
             (domid, longestMatch, localPart) = self._get_ox_domid(validation_domain_name)
-            self._add_ox_txt_rr(domid, validation_domain_name, validation)
+            self._add_txt_rr(domid, validation_domain_name, validation)
 
             validations.append((longestMatch, validation_domain_name, validation))
             responses.append(achall.response(achall.account_key))
@@ -184,12 +255,15 @@ class Authenticator(dns_common.DNSAuthenticator):
     def _perform(self, domain, validation_domain_name, validation):
         logger.debug("_perform: domain %s validation_domain_name %s validation %s", domain, validation_domain_name, validation)
         (domid, longestMatch, localPart) = self._get_ox_domid(validation_domain_name)
-        self._add_ox_txt_rr(domid, validation_domain_name, validation)
+        self._add_txt_rr(domid, validation_domain_name, validation)
 
     def _cleanup(self, domain, validation_domain_name, validation):
         logger.debug("_cleanup: domain %s validation_domain_name %s validation %s", domain, validation_domain_name, validation)
         (domid, longestMatch, localPart) = self._get_ox_domid(validation_domain_name)
-        self._rm_ox_txt_rr(domid, localPart)
+        if self._use_token():
+            self._rm_api_txt_rr(domid, validation_domain_name, validation)
+        else:
+            self._rm_ox_txt_rr(domid, localPart)
 
     def get_authoritative_nameservers(self, domain):
         try:
